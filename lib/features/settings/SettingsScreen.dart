@@ -4,16 +4,18 @@ import '../auth/Login.dart';
 import 'ThemeSelectionScreen.dart'; // Import ThemeSelectionScreen
 import '/services/user_service.dart'; // Import UserService
 import 'package:firebase_storage/firebase_storage.dart'; // Import Firebase Storage
+import 'package:file_picker/file_picker.dart'; // Import File Picker
 import 'package:path/path.dart' as path; // สำหรับการจัดการชื่อไฟล์
+import 'package:cloud_firestore/cloud_firestore.dart'; // Import Firestore
 
 class SettingsScreen extends StatefulWidget {
   final Function(ThemeMode) onThemeChange;
-  final Function(String) onAnimationSelected; // Callback สำหรับแอนิเมชัน
+  final Function(String) onAnimationSelected; // เพิ่ม callback สำหรับแอนิเมชัน
 
   const SettingsScreen({
     super.key,
     required this.onThemeChange,
-    required this.onAnimationSelected, // Callback สำหรับแอนิเมชัน
+    required this.onAnimationSelected, // เพิ่ม callback สำหรับแอนิเมชัน
   });
 
   @override
@@ -24,7 +26,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   User? _user;
   String? _selectedProvince;
   ThemeMode _currentTheme = ThemeMode.system;
-  String? selectedAnimationUrl; // ตัวแปรเก็บ URL ของภาพเคลื่อนไหวที่เลือก
+  String? selectedAnimationUrl; // เพิ่มตัวแปรเก็บ URL ของภาพเคลื่อนไหวที่เลือก
 
   @override
   void initState() {
@@ -78,6 +80,96 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  // อัปเดต URL ของภาพเคลื่อนไหวใน Firestore
+  Future<void> _updateAnimationInFirestore(String animationUrl) async {
+    if (_user != null) {
+      await UserService.updateSelectedAnimation(_user!.uid, animationUrl);
+    }
+  }
+
+  void _handleLogout() async {
+    await FirebaseAuth.instance.signOut();
+    setState(() {
+      _user = null;
+    });
+    print('User has logged out.');
+  }
+
+  Future<void> _uploadAnimationFile() async {
+    FilePickerResult? result =
+        await FilePicker.platform.pickFiles(type: FileType.any);
+
+    if (result != null) {
+      String fileName = path.basename(result.files.single.name);
+      String fileExtension =
+          path.extension(fileName).toLowerCase(); // ดึงนามสกุลไฟล์
+      PlatformFile file = result.files.first;
+
+      try {
+        FirebaseStorage storage = FirebaseStorage.instance;
+        TaskSnapshot uploadTask =
+            await storage.ref('animation/$fileName').putData(file.bytes!);
+
+        String downloadURL = await uploadTask.ref.getDownloadURL();
+
+        // ตรวจสอบนามสกุลไฟล์ และบันทึกชนิดไฟล์ใน Firestore
+        String fileType = fileExtension == '.mp4'
+            ? 'video'
+            : 'image'; // ตรวจสอบไฟล์ .mp4 หรือไฟล์รูปภาพอื่น ๆ
+
+        // อัปเดตข้อมูลไฟล์และชนิดไฟล์ลง Firestore
+        await FirebaseFirestore.instance
+            .collection('userSettings')
+            .doc(_user!.uid)
+            .set({
+          'selectedAnimation': downloadURL,
+          'fileType': fileType, // บันทึกประเภทของไฟล์
+        });
+
+        setState(() {
+          selectedAnimationUrl = downloadURL;
+        });
+
+        // ส่ง URL ของแอนิเมชันกลับไปยัง WeatherScreen
+        widget.onAnimationSelected(downloadURL); // เรียก callback
+
+        print('File uploaded! Download URL: $downloadURL');
+        print('File type: $fileType');
+      } catch (e) {
+        print('Failed to upload file: $e');
+      }
+    } else {
+      print('No file selected');
+    }
+  }
+
+  // ฟังก์ชันลบไฟล์จาก Storage และ Firestore
+  Future<void> _deleteAnimationFile(String fileName) async {
+    try {
+      FirebaseStorage storage = FirebaseStorage.instance;
+
+      // ลบไฟล์จาก Firebase Storage
+      await storage.ref('animation/$fileName').delete();
+
+      // ลบข้อมูลที่เกี่ยวข้องใน Firestore
+      await FirebaseFirestore.instance
+          .collection('userSettings')
+          .doc(_user!.uid)
+          .update({
+        'selectedAnimation': FieldValue.delete(),
+        'fileType': FieldValue.delete(),
+      });
+
+      setState(() {
+        selectedAnimationUrl = null; // รีเซ็ต URL ของภาพเคลื่อนไหว
+      });
+
+      print('File deleted successfully!');
+    } catch (e) {
+      print('Failed to delete file: $e');
+    }
+  }
+
   Future<List<String>> _fetchAnimationFiles() async {
     List<String> fileNames = [];
     try {
@@ -107,8 +199,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
               itemCount: animationFiles.length,
               itemBuilder: (context, index) {
                 return ListTile(
-                  title: Text(path.basenameWithoutExtension(animationFiles[
-                      index])), // ใช้ path.basenameWithoutExtension เพื่อแสดงชื่อไฟล์โดยไม่มีนามสกุล
+                  title: Text(animationFiles[index]),
+                  trailing: IconButton(
+                    icon: Icon(Icons.delete),
+                    onPressed: () async {
+                      // ยืนยันก่อนลบ
+                      bool confirmDelete = await showDialog(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          title: const Text('Confirm Delete'),
+                          content: const Text(
+                              'Are you sure you want to delete this file?'),
+                          actions: [
+                            TextButton(
+                              onPressed: () {
+                                Navigator.of(context).pop(false);
+                              },
+                              child: const Text('Cancel'),
+                            ),
+                            TextButton(
+                              onPressed: () {
+                                Navigator.of(context).pop(true);
+                              },
+                              child: const Text('Delete'),
+                            ),
+                          ],
+                        ),
+                      );
+
+                      if (confirmDelete == true) {
+                        await _deleteAnimationFile(animationFiles[index]);
+                      }
+                    },
+                  ),
                   onTap: () async {
                     String selectedFileUrl = await FirebaseStorage.instance
                         .ref('animation/${animationFiles[index]}')
@@ -119,11 +242,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     });
 
                     // อัปเดต URL ของภาพเคลื่อนไหวใน Firestore
-                    await UserService.updateSelectedAnimation(
-                        _user!.uid, selectedFileUrl);
+                    await _updateAnimationInFirestore(selectedFileUrl);
 
                     // ส่ง URL ของแอนิเมชันกลับไปยัง WeatherScreen
-                    widget.onAnimationSelected(selectedFileUrl);
+                    widget
+                        .onAnimationSelected(selectedFileUrl); // เรียก callback
 
                     Navigator.of(context).pop();
                   },
@@ -134,14 +257,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         );
       },
     );
-  }
-
-  void _handleLogout() async {
-    await FirebaseAuth.instance.signOut();
-    setState(() {
-      _user = null;
-    });
-    print('User has logged out.');
   }
 
   @override
@@ -200,6 +315,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
             subtitle: Text(_selectedProvince ?? 'Select your province'),
             onTap: () {
               _selectProvince(context);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.add_photo_alternate),
+            title: const Text('Add Picture Animation'),
+            onTap: () {
+              _uploadAnimationFile();
             },
           ),
           ListTile(
